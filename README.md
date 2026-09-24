@@ -1,3 +1,6 @@
+(Ainda em desenvolvimento)
+
+
 # Módulo 1: Camada Bronze 
 
 Esta implementação do **Primeiro Módulo** da pipeline de dados financeiros do projeto. O objetivo principal deste módulo é realizar a extração, controle e carga (EL/ETL) automatizada das demonstrações financeiras publicadas pelas companhias abertas na **CVM** na **Camada Bronze** da nossa arquitetura Medallion.
