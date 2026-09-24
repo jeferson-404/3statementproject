@@ -1,0 +1,9 @@
+# ==== Carga / rede ====
+requests>=2.31
+python-dotenv>=1.0
+
+# ==== Dados ====
+pandas>=2.0
+
+# ==== Banco ====
+psycopg2-binary>=2.9

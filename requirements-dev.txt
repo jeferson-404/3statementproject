@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Qualidade de código
+ruff>=0.12
+
+# Testes
+pytest>=8.0
+pytest-cov>=6.0

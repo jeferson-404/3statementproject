@@ -1,0 +1,258 @@
+# Bugs encontrados em `CamadaBronze/load_bronze.py` — via `test_load_bronze.py`
+
+
+---
+
+## Bug 1 — `vl_conta` não era convertido para número (crítico)
+
+**Onde:** função `extrair_csvs`, linhas 133-140:
+
+```python
+with zf.open(nome_csv) as f:
+    df = pd.read_csv(
+        f,
+        sep=";",
+        decimal=",",
+        encoding="latin1",
+        dtype=str,
+    )
+```
+
+**O que estava acontecendo:** o parâmetro `dtype=str` força o pandas a ler
+**todas** as colunas do CSV como texto puro, sem nenhuma conversão
+automática. Isso inclui a coluna `vl_conta` — que fica como a string crua
+do CSV, no formato numérico brasileiro (ex.: `"1.234,56"`). O parâmetro
+`decimal=","`, escrito logo acima, **não tem efeito nenhum** nesse
+cenário: ele só instrui o parser numérico do pandas sobre qual caractere
+é o separador decimal, mas com `dtype=str` esse parser numérico nunca
+chega a rodar.
+
+O problema só se manifestava adiante, em `normalizar_dataframe`, linha 208:
+
+```python
+df["vl_conta"] = pd.to_numeric(df["vl_conta"], errors="coerce")
+```
+
+`pd.to_numeric("1.234,56")` não entende ponto como separador de milhar
+nem vírgula como separador decimal — só reconhece o formato
+americano (`1234.56`). Com `errors="coerce"`, toda conversão que falha
+vira `NaN` silenciosamente, sem lançar exceção.
+
+**Erro que isso causava:** `vl_conta` chegava como `NaN` para
+praticamente qualquer valor real vindo da CVM. Como `vl_conta` é um dos
+campos obrigatórios verificados logo depois (linha 217-218,
+`obrigatorias = [..., "vl_conta"]` seguido de `dropna`), **toda linha de
+dado real seria descartada silenciosamente**, sem nenhum erro visível no
+terminal — o pipeline "funcionaria" e o banco ficaria vazio. O teste
+`test_converte_vl_conta` (esperando `1234.56` a partir de `"1.234,56"`)
+foi quem pegou isso antes de rodar contra dado de verdade.
+
+**Correção aplicada:**
+1. Removido o `decimal=","` de `extrair_csvs` (era enganoso — não fazia
+   nada com `dtype=str`, e dava a falsa impressão de que a conversão já
+   estava tratada ali).
+2. Criada a função `_converter_valor_brasileiro()`, que faz a conversão
+   manualmente antes de chamar `pd.to_numeric`: remove pontos de milhar
+   e troca vírgula por ponto decimal:
+   ```python
+   def _converter_valor_brasileiro(serie: pd.Series) -> pd.Series:
+       serie_limpa = (
+           serie.astype(str).str.strip()
+           .str.replace(".", "", regex=False)
+           .str.replace(",", ".", regex=False)
+       )
+       return pd.to_numeric(serie_limpa, errors="coerce")
+   ```
+3. Em `normalizar_dataframe`, a linha `vl_conta` agora chama essa função:
+   `df["vl_conta"] = _converter_valor_brasileiro(df["vl_conta"])`.
+
+---
+
+## Bug 2 — Colunas ausentes na fonte quebravam BPA/BPP (crítico)
+
+**Onde:** função `normalizar_dataframe`, linhas 181-199:
+
+```python
+colunas_possiveis = [
+    "cnpj_cia", "denom_cia", "cd_cvm", "grupo_dfp", "moeda", "escala_moeda",
+    "ordem_exerc", "dt_refer", "versao", "dt_ini_exerc", "dt_fim_exerc",
+    "cd_conta", "ds_conta", "vl_conta", "st_conta_fixa", "coluna_df",
+]
+df = df[[c for c in colunas_possiveis if c in df.columns]]
+```
+
+**O que estava acontecendo:** essa linha só mantém, no DataFrame de
+saída, as colunas que **já existiam** no CSV de origem. Isso parece
+inofensivo, mas os CSVs reais de **BPA e BPP não têm a coluna
+`DT_INI_EXERC`** (balanço patrimonial é uma "foto" de um instante, não
+tem data de início de período — só DFC, DRE, DRA e DVA têm). Então, para
+esses dois demonstrativos, a coluna `dt_ini_exerc` simplesmente nunca
+era criada no DataFrame resultante.
+
+**Erro que isso causava:** lá na frente, `upsert_demonstrativos`
+(linha 248) lista `"dt_ini_exerc"` explicitamente entre as colunas que
+tenta selecionar do DataFrame antes de montar o `INSERT`:
+```python
+colunas = [..., "dt_ini_exerc", "dt_fim_exerc", ...]
+registros = df[colunas].where(...)
+```
+Como essa coluna nunca existia para BPA/BPP, isso gerava um
+`KeyError: 'dt_ini_exerc'` assim que o pipeline tentasse carregar
+qualquer um desses dois demonstrativos — que são, ironicamente, o
+próprio Balanço Patrimonial, essencial para o 3-statement model. O teste
+`test_cria_colunas_ausentes_como_none` (esperando que `dt_ini_exerc`
+existisse como coluna, mesmo vazia) pegou esse comportamento antes de
+isso quebrar contra dado real.
+
+**Correção aplicada:**
+1. Criada a constante `COLUNAS_ESPERADAS` (substitui `colunas_possiveis`)
+   com a mesma lista de 16 colunas, mas tratada como uma garantia, não
+   um filtro.
+2. Antes de selecionar as colunas, o código agora preenche com `None`
+   qualquer uma que esteja faltando:
+   ```python
+   for coluna in COLUNAS_ESPERADAS:
+       if coluna not in df.columns:
+           df[coluna] = None
+   df = df[COLUNAS_ESPERADAS]
+   ```
+3. Efeito colateral positivo tratado também: como BPA/BPP não têm
+   `DT_FIM_EXERC` de forma confiável em todo cenário, adicionei um
+   preenchimento de `dt_fim_exerc` com o valor de `dt_refer` quando
+   ausente (mantendo `dt_ini_exerc` como `None`, que é o comportamento
+   correto — a coluna é `NULL`-ável no schema para esse caso). Esse
+   preenchimento precisou ser feito **antes** da conversão de data
+   (`pd.to_datetime`), porque fazer depois faz o pandas promover o valor
+   de `date` para `Timestamp` quando a coluna inteira está vazia, e a
+   comparação de tipos no teste
+   (`test_preenche_dt_fim_exerc_com_dt_refer_para_bpa`) quebrava por
+   causa disso — foi o segundo ajuste fino que só apareceu ao rodar o
+   teste de verdade, não só na leitura do código.
+
+---
+
+Bug 3 — NaT chegando ao Postgres como string literal (encontrado ao rodar com dado real)
+
+Onde: função normalizar_dataframe, linhas 201-204 (versão já com as correções 1 e 2 aplicadas):
+
+python
+for col_data in ("dt_refer", "dt_ini_exerc", "dt_fim_exerc"):
+    df[col_data] = pd.to_datetime(df[col_data], errors="coerce").dt.date
+
+combinado com upsert_demonstrativos, linha 257:
+
+python
+registros = df[colunas].where(pd.notnull(df[colunas]), None).values.tolist()
+
+O que estava acontecendo: nenhum dos 15 testes unitários pegou esse bug — ele só apareceu ao rodar contra um ZIP real da CVM (DFP 2023). Quando uma coluna de data fica inteiramente vazia (ex.: dt_ini_exerc para todas as linhas de BPA/BPP, que não têm essa informação), o pandas mantém o tipo da coluna como datetime64 preenchida com NaT, em vez de converter para uma coluna de objetos date/None. O problema é que NaT é o "valor nulo nativo" desse tipo de coluna para o pandas — e por isso, mesmo o .where(pd.notnull(df[colunas]), None) que já existia não consegue substituir esse NaT por None de verdade: o pandas insiste em devolver NaT de novo. Validei isso isoladamente:
+
+python
+>>> df.where(pd.notnull(df), None)['dt_ini_exerc'].tolist()
+[NaT, NaT]   # continua NaT, não virou None
+
+Erro que isso causava: o psycopg2 recebia esse NaT como parâmetro da query e, não sabendo traduzir esse valor especial para NULL, mandava a representação em string 'NaT' literalmente para o Postgres:
+
+ERRO: invalid input syntax for type timestamp: "NaT"
+LINE 3: ...REAL', 'MIL', 'PENÚLTIMO', '2023-12-31'::date, 1, 'NaT'::tim...
+
+Isso derrubava o processamento de BPA e BPP com dado real — o mesmo par de demonstrações do Bug 2, só que essa segunda camada do problema só aparece com CSV de verdade, não com os fixtures pequenos dos testes.
+
+Correção aplicada: em vez de deixar o pandas decidir a representação de "vazio" (que varia conforme o tipo da coluna) e confiar em .where()/pd.notnull() para arrumar depois, a conversão agora é feita elemento a elemento, garantindo None do Python de forma explícita e definitiva:
+
+python
+for col_data in ("dt_refer", "dt_ini_exerc", "dt_fim_exerc"):
+    convertida = pd.to_datetime(df[col_data], errors="coerce")
+    df[col_data] = [d.date() if pd.notna(d) else None for d in convertida]
+
+
+Bug 4 — numeric field overflow ao carregar DFP 2021 e 2022
+
+Rodando a carga histórica completa (load_bronze.py, DFP e ITR, 2010–2026), os anos DFP 2021 e DFP 2022 falharam. O terminal mostrou:
+[DFP 2020] OK — 491153 linhas processadas.
+[DFP 2021] baixando https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_aberta_2021.zip ...
+[DFP 2021] ERRO: numeric field overflow
+DETAIL:  A field with precision 20, scale 4 must round to an absolute value less than 10^16.
+
+[DFP 2022] baixando https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_aberta_2022.zip ...
+[DFP 2022] ERRO: numeric field overflow
+DETAIL:  A field with precision 20, scale 4 must round to an absolute value less than 10^16.
+
+[DFP 2023] sem mudanças desde a última execução. Pulando.
+[DFP 2024] OK — 536490 linhas processadas.
+
+O erro vinha do Postgres, não do Python. O try/except do processar_ano capturou, fez rollback() e registrou a linha em bronze.controle_ingestao com status = 'ERRO'. Como o rollback é por ano, 2021 e 2022 foram descartados inteiros — inclusive as linhas boas daqueles anos.
+
+O controle_ingestao confirmou o erro, mas não dizia qual linha causou o overflow. Foi preciso rodar um script de diagnóstico que baixa o ZIP, normaliza os DataFrames e imprime as linhas com |vl_conta| > 10^16:
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from CamadaBronze.load_bronze import montar_url, baixar_zip, extrair_csvs, normalizar_dataframe
+
+for ano in (2021, 2022):
+    url, nome = montar_url("DFP", ano)
+    conteudo = baixar_zip(url)
+    tabelas = extrair_csvs(conteudo, "DFP", ano)
+    print(f"\n===== DFP {ano} =====")
+    for demo, df_bruto in tabelas.items():
+        df = normalizar_dataframe(df_bruto, "DFP", demo, ano, nome)
+        if df.empty:
+            continue
+        maior = df["vl_conta"].abs().max()
+        if maior > 10**16:
+            suspeitos = df[df["vl_conta"].abs() > 10**16]
+            print(f"\n{demo}: max |vl_conta| = {maior:,.2f}  ({len(suspeitos)} linhas)")
+            print(suspeitos[["denom_cia", "cd_conta", "ds_conta",
+                             "ordem_exerc", "vl_conta"]].to_string())
+
+
+===== DFP 2021 =====
+DRE: max |vl_conta| = 27,440,000,000,000,000.00  (2 linhas acima do limite)
+               denom_cia    cd_conta ds_conta ordem_exerc      vl_conta
+27234  MARISA LOJAS S.A.  3.99.01.01       ON   PENÚLTIMO -1.653350e+16
+27235  MARISA LOJAS S.A.  3.99.01.01       ON      ÚLTIMO -2.744000e+16
+
+===== DFP 2022 =====
+DRE: max |vl_conta| = 33,800,000,000,000,000.00  (1 linha acima do limite)
+                                       denom_cia    cd_conta ds_conta ordem_exerc      vl_conta
+6878  CTC - CENTRO DE TECNOLOGIA CANAVIEIRA S.A.  3.99.01.01       ON   PENÚLTIMO  3.380000e+16
+
+
+Os valores estavam concentrados na conta 3.99.01.01 (linha ON da DRE, usada como conta de ajuste/fechamento).
+
+Antes de corrigir, foi preciso confirmar se o valor absurdo está no CSV cru ou se era gerado pela conversão do pandas. O script de verificação lê a linha diretamente do ZIP, sem passar pelo pd.read_csv:
+
+python
+import io, sys, zipfile
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import requests
+
+url = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_aberta_2021.zip"
+r = requests.get(url, timeout=120)
+
+with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+    with zf.open("dfp_cia_aberta_DRE_con_2021.csv") as f:
+        for linha_bytes in f:
+            linha = linha_bytes.decode("latin1")
+            if "MARISA" in linha.upper() and "3.99.01.01" in linha:
+                print(repr(linha))
+Saída:
+
+text
+'61.189.288/0001-89;2021-12-31;1;MARISA LOJAS S.A.;022055;DF Consolidado - Demonstração do Resultado;REAL;MIL;PENÚLTIMO;2020-01-01;2020-12-31;3.99.01.01;ON;-16533500000000001.0000000000;N\r\n'
+'61.189.288/0001-89;2021-12-31;1;MARISA LOJAS S.A.;022055;DF Consolidado - Demonstração do Resultado;REAL;MIL;ÚLTIMO;2021-01-01;2021-12-31;3.99.01.01;ON;-27439999999999998.0000000000;N\r\n'
+Conclusão: o valor gigante está no CSV cru da CVM — não é bug do pd.read_csv, do pd.to_numeric, nem do _converter_valor_numerico. É dado corrompido na fonte.
+
+Indícios extras que confirmam a corrupção:
+
+O último dígito dos valores (...0001, ...9998) não é típico de valor contábil. É resíduo de perda de precisão do float64 no arquivo gerado pela CVM.
+
+Comparando com outras empresas na mesma conta 3.99.01.01, os valores normais ficam entre 0 e 8000 (na escala MIL). Marisa e CTC estão 15 ordens de grandeza acima.
+
+Em DFP 2022, a CTC tem o valor ÚLTIMO normal (4178.00) e só o PENÚLTIMO corrompido (3.38×10^16). Não é escala errada aplicada ao ano inteiro — é uma linha específica.
+
+Como o dado é fiel à fonte (Bronze deve ser espelho), a correção não é filtrar o valor, é ampliar a precisão da coluna. NUMERIC(20,4) estava apertado demais.
+
+Entao fiz NUMERIC(30,4)
