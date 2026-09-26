@@ -32,7 +32,7 @@ from bd_conect import get_connection
 # ============================================================
 # PASSO 0 — CONFIGURAÇÃO
 # ============================================================
-ANO_INICIAL = 2010
+ANO_INICIAL = 2018
 ANO_FINAL = 2026  # <-- ajuste para o ano corrente quando for rodar
 
 TIPOS_DOCUMENTO = ["DFP", "ITR"]
@@ -498,10 +498,11 @@ def main():
     except (OSError, psycopg2.OperationalError) as e:
         print(f"ERRO: não foi possível conectar ao banco. {e}")
         sys.exit(1)
-
+ 
     try:
-        # TESTE: só ITR de um ano
-        processar_ano(conn, "ITR", 2023)
+        for tipo_documento in TIPOS_DOCUMENTO:
+            for ano in range(ANO_INICIAL, ANO_FINAL + 1):
+                processar_ano(conn, tipo_documento, ano)
     finally:
         conn.close()
 
